@@ -1,25 +1,31 @@
-import os
-import functools
 import argparse
 import copy
+import functools
+import os
 
 import numpy as np
 import pandas as pd
-from tqdm import tqdm
-
 import torch
-from torch.utils.data import Dataset, DataLoader
-from torchvision import datasets
+
+# from torchvision import datasets
 import torch.nn as nn
 import torch.nn.functional as F
+from datasets import load_dataset
 
 # make sure to install promptsource, transformers, and datasets!
 from promptsource.templates import DatasetTemplates
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForMaskedLM, AutoModelForCausalLM
-from datasets import load_dataset
-
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
+from transformers import (
+    AutoModelForCausalLM,
+    AutoModelForMaskedLM,
+    AutoModelForSeq2SeqLM,
+    AutoTokenizer,
+)
 
 ############# Model loading and result saving #############
+
+EXCLUDE_GENERATION_ARGS = ["save_dir", "cache_dir", "device"]
 
 # Map each model name to its full Huggingface name; this is just for convenience for common models. You can run whatever model you'd like.
 model_mapping = {
@@ -34,10 +40,10 @@ model_mapping = {
 
 
 def get_parser():
+    """Returns the parser and argument names for saving and loading hidden states.
     """
-    Returns the parser we will use for generate.py and evaluate.py
-    (We include it here so that we can use the same parser for both scripts)
-    """
+    arg_names = ["model_name", "cache_dir", "parallelize", "device", "dataset_name", "split", "prompt_idx", "batch_size", "num_examples", "use_decoder", "layer", "all_layers", "token_idx", "save_dir"]
+
     parser = argparse.ArgumentParser()
     # setting up model
     parser.add_argument("--model_name", type=str, default="T5", help="Name of the model to use")
@@ -58,7 +64,7 @@ def get_parser():
     # saving the hidden states
     parser.add_argument("--save_dir", type=str, default="generated_hidden_states", help="Directory to save the hidden states")
 
-    return parser
+    return parser, arg_names
 
 
 def load_model(model_name, cache_dir=None, parallelize=False, device="cuda"):
@@ -83,9 +89,9 @@ def load_model(model_name, cache_dir=None, parallelize=False, device="cuda"):
         except:
             model = AutoModelForCausalLM.from_pretrained(full_model_name, cache_dir=cache_dir)
             model_type = "decoder"
-    
-        
-    # specify model_max_length (the max token length) to be 512 to ensure that padding works 
+
+
+    # specify model_max_length (the max token length) to be 512 to ensure that padding works
     # (it's not set by default for e.g. DeBERTa, but it's necessary for padding to work properly)
     tokenizer = AutoTokenizer.from_pretrained(full_model_name, cache_dir=cache_dir, model_max_length=512)
     model.eval()
@@ -101,7 +107,7 @@ def load_model(model_name, cache_dir=None, parallelize=False, device="cuda"):
 
 def save_generations(generation, args, generation_type):
     """
-    Input: 
+    Input:
         generation: numpy array (e.g. hidden_states or labels) to save
         args: arguments used to generate the hidden states. This is used for the filename to save to.
         generation_type: one of "negative_hidden_states" or "positive_hidden_states" or "labels"
@@ -109,9 +115,7 @@ def save_generations(generation, args, generation_type):
     Saves the generations to an appropriate directory.
     """
     # construct the filename based on the args
-    arg_dict = vars(args)
-    exclude_keys = ["save_dir", "cache_dir", "device"]
-    filename = generation_type + "__" + "__".join(['{}_{}'.format(k, v) for k, v in arg_dict.items() if k not in exclude_keys]) + ".npy".format(generation_type)
+    filename = get_generation_filename(args, generation_type)
 
     # create save directory if it doesn't exist
     if not os.path.exists(args.save_dir):
@@ -121,11 +125,17 @@ def save_generations(generation, args, generation_type):
     np.save(os.path.join(args.save_dir, filename), generation)
 
 
+def concat_args_str(args, exclude_keys):
+    arg_dict = vars(args)
+    return "__".join(['{}_{}'.format(k, v) for k, v in arg_dict.items() if k not in exclude_keys])
+
+def get_generation_filename(args: argparse.Namespace, generation_type: str) -> str:
+    filename = concat_args_str(args, EXCLUDE_GENERATION_ARGS)
+    return generation_type + "__" + filename + ".npy"
+
 def load_single_generation(args, generation_type="hidden_states"):
     # use the same filename as in save_generations
-    arg_dict = vars(args)
-    exclude_keys = ["save_dir", "cache_dir", "device"]
-    filename = generation_type + "__" + "__".join(['{}_{}'.format(k, v) for k, v in arg_dict.items() if k not in exclude_keys]) + ".npy".format(generation_type)
+    filename = get_generation_filename(args, generation_type)
     return np.load(os.path.join(args.save_dir, filename))
 
 
@@ -141,12 +151,12 @@ def load_all_generations(args):
 ############# Data #############
 class ContrastDataset(Dataset):
     """
-    Given a dataset and tokenizer (from huggingface), along with a collection of prompts for that dataset from promptsource and a corresponding prompt index, 
+    Given a dataset and tokenizer (from huggingface), along with a collection of prompts for that dataset from promptsource and a corresponding prompt index,
     returns a dataset that creates contrast pairs using that prompt
-    
+
     Truncates examples larger than max_len, which can mess up contrast pairs, so make sure to only give it examples that won't be truncated.
     """
-    def __init__(self, raw_dataset, tokenizer, all_prompts, prompt_idx, 
+    def __init__(self, raw_dataset, tokenizer, all_prompts, prompt_idx,
                  model_type="encoder_decoder", use_decoder=False, device="cuda"):
 
         # data and tokenizer
@@ -155,7 +165,7 @@ class ContrastDataset(Dataset):
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.device = device
-        
+
         # for formatting the answers
         self.model_type = model_type
         self.use_decoder = use_decoder
@@ -172,17 +182,17 @@ class ContrastDataset(Dataset):
     def encode(self, nl_prompt):
         """
         Tokenize a given natural language prompt (from after applying self.prompt to an example)
-        
+
         For encoder-decoder models, we can either:
         (1) feed both the question and answer to the encoder, creating contrast pairs using the encoder hidden states
             (which uses the standard tokenization, but also passes the empty string to the decoder), or
         (2) feed the question the encoder and the answer to the decoder, creating contrast pairs using the decoder hidden states
-        
+
         If self.decoder is True we do (2), otherwise we do (1).
         """
         # get question and answer from prompt
         question, answer = nl_prompt
-        
+
         # tokenize the question and answer (depending upon the model type and whether self.use_decoder is True)
         if self.model_type == "encoder_decoder":
             input_ids = self.get_encoder_decoder_input_ids(question, answer)
@@ -190,7 +200,7 @@ class ContrastDataset(Dataset):
             input_ids = self.get_encoder_input_ids(question, answer)
         else:
             input_ids = self.get_decoder_input_ids(question, answer)
-        
+
         # get rid of the batch dimension since this will be added by the Dataloader
         if input_ids["input_ids"].shape[0] == 1:
             for k in input_ids:
@@ -203,7 +213,7 @@ class ContrastDataset(Dataset):
         """
         Format the input ids for encoder-only models; standard formatting.
         """
-        combined_input = question + " " + answer 
+        combined_input = question + " " + answer
         input_ids = self.tokenizer(combined_input, truncation=True, padding="max_length", return_tensors="pt")
 
         return input_ids
@@ -234,7 +244,7 @@ class ContrastDataset(Dataset):
             # feed the empty string to the decoder (i.e. just ignore it -- but it needs an input or it'll throw an error)
             input_ids = self.tokenizer(question, answer, truncation=True, padding="max_length", return_tensors="pt")
             decoder_input_ids = self.tokenizer("", return_tensors="pt")
-        
+
         # move everything into input_ids so that it's easier to pass to the model
         input_ids["decoder_input_ids"] = decoder_input_ids["input_ids"]
         input_ids["decoder_attention_mask"] = decoder_input_ids["attention_mask"]
@@ -272,7 +282,7 @@ class ContrastDataset(Dataset):
         # return the tokenized inputs, the text prompts, and the true label
         return neg_ids, pos_ids, neg_prompt, pos_prompt, true_answer
 
-    
+
 def get_dataloader(dataset_name, split, tokenizer, prompt_idx, batch_size=16, num_examples=1000,
                    model_type="encoder_decoder", use_decoder=False, device="cuda", pin_memory=True, num_workers=1):
     """
@@ -287,8 +297,8 @@ def get_dataloader(dataset_name, split, tokenizer, prompt_idx, batch_size=16, nu
     all_prompts = DatasetTemplates(dataset_name)
 
     # create the ConstrastDataset
-    contrast_dataset = ContrastDataset(raw_dataset, tokenizer, all_prompts, prompt_idx, 
-                                       model_type=model_type, use_decoder=use_decoder, 
+    contrast_dataset = ContrastDataset(raw_dataset, tokenizer, all_prompts, prompt_idx,
+                                       model_type=model_type, use_decoder=use_decoder,
                                        device=device)
 
     # get a random permutation of the indices; we'll take the first num_examples of these that do not get truncated
@@ -333,16 +343,16 @@ def get_first_mask_loc(mask, shift=False):
 
 def get_individual_hidden_states(model, batch_ids, layer=None, all_layers=True, token_idx=-1, model_type="encoder_decoder", use_decoder=False):
     """
-    Given a model and a batch of tokenized examples, returns the hidden states for either 
+    Given a model and a batch of tokenized examples, returns the hidden states for either
     a specified layer (if layer is a number) or for all layers (if all_layers is True).
-    
+
     If specify_encoder is True, uses "encoder_hidden_states" instead of "hidden_states"
     This is necessary for getting the encoder hidden states for encoder-decoder models,
     but it is not necessary for encoder-only or decoder-only models.
     """
     if use_decoder:
         assert "decoder" in model_type
-        
+
     # forward pass
     with torch.no_grad():
         batch_ids = batch_ids.to(model.device)
@@ -374,7 +384,7 @@ def get_individual_hidden_states(model, batch_ids, layer=None, all_layers=True, 
         mask = batch_ids["decoder_attention_mask"] if (model_type == "encoder_decoder" and use_decoder) else batch_ids["attention_mask"]
         first_mask_loc = get_first_mask_loc(mask).squeeze()
         final_hs = hs[torch.arange(hs.size(0)), first_mask_loc+token_idx]  # (bs, dim, num_layers)
-    
+
     return final_hs
 
 
@@ -393,9 +403,9 @@ def get_all_hidden_states(model, dataloader, layer=None, all_layers=True, token_
     for batch in tqdm(dataloader):
         neg_ids, pos_ids, _, _, gt_label = batch
 
-        neg_hs = get_individual_hidden_states(model, neg_ids, layer=layer, all_layers=all_layers, token_idx=token_idx, 
+        neg_hs = get_individual_hidden_states(model, neg_ids, layer=layer, all_layers=all_layers, token_idx=token_idx,
                                               model_type=model_type, use_decoder=use_decoder)
-        pos_hs = get_individual_hidden_states(model, pos_ids, layer=layer, all_layers=all_layers, token_idx=token_idx, 
+        pos_hs = get_individual_hidden_states(model, pos_ids, layer=layer, all_layers=all_layers, token_idx=token_idx,
                                               model_type=model_type, use_decoder=use_decoder)
 
         if dataloader.batch_size == 1:
@@ -404,7 +414,7 @@ def get_all_hidden_states(model, dataloader, layer=None, all_layers=True, token_
         all_neg_hs.append(neg_hs)
         all_pos_hs.append(pos_hs)
         all_gt_labels.append(gt_label)
-    
+
     all_neg_hs = np.concatenate(all_neg_hs, axis=0)
     all_pos_hs = np.concatenate(all_pos_hs, axis=0)
     all_gt_labels = np.concatenate(all_gt_labels, axis=0)
@@ -424,7 +434,7 @@ class MLPProbe(nn.Module):
         return torch.sigmoid(o)
 
 class CCS(object):
-    def __init__(self, x0, x1, nepochs=1000, ntries=10, lr=1e-3, batch_size=-1, 
+    def __init__(self, x0, x1, nepochs=1000, ntries=10, lr=1e-3, batch_size=-1,
                  verbose=False, device="cuda", linear=True, weight_decay=0.01, var_normalize=False):
         # data
         self.var_normalize = var_normalize
@@ -440,19 +450,19 @@ class CCS(object):
         self.device = device
         self.batch_size = batch_size
         self.weight_decay = weight_decay
-        
+
         # probe
         self.linear = linear
         self.probe = self.initialize_probe()
         self.best_probe = copy.deepcopy(self.probe)
 
-        
+
     def initialize_probe(self):
         if self.linear:
             self.probe = nn.Sequential(nn.Linear(self.d, 1), nn.Sigmoid())
         else:
             self.probe = MLPProbe(self.d)
-        self.probe.to(self.device)    
+        self.probe.to(self.device)
 
 
     def normalize(self, x):
@@ -466,7 +476,7 @@ class CCS(object):
 
         return normalized_x
 
-        
+
     def get_tensor_data(self):
         """
         Returns x0, x1 as appropriate tensors (rather than np arrays)
@@ -474,7 +484,7 @@ class CCS(object):
         x0 = torch.tensor(self.x0, dtype=torch.float, requires_grad=False, device=self.device)
         x1 = torch.tensor(self.x1, dtype=torch.float, requires_grad=False, device=self.device)
         return x0, x1
-    
+
 
     def get_loss(self, p0, p1):
         """
@@ -499,8 +509,8 @@ class CCS(object):
         acc = max(acc, 1 - acc)
 
         return acc
-    
-        
+
+
     def train(self):
         """
         Does a single training run of nepochs epochs
@@ -508,10 +518,10 @@ class CCS(object):
         x0, x1 = self.get_tensor_data()
         permutation = torch.randperm(len(x0))
         x0, x1 = x0[permutation], x1[permutation]
-        
+
         # set up optimizer
         optimizer = torch.optim.AdamW(self.probe.parameters(), lr=self.lr, weight_decay=self.weight_decay)
-        
+
         batch_size = len(x0) if self.batch_size == -1 else self.batch_size
         nbatches = len(x0) // batch_size
 
@@ -520,7 +530,7 @@ class CCS(object):
             for j in range(nbatches):
                 x0_batch = x0[j*batch_size:(j+1)*batch_size]
                 x1_batch = x1[j*batch_size:(j+1)*batch_size]
-            
+
                 # probe
                 p0, p1 = self.probe(x0_batch), self.probe(x1_batch)
 
@@ -533,7 +543,7 @@ class CCS(object):
                 optimizer.step()
 
         return loss.detach().cpu().item()
-    
+
     def repeated_train(self):
         best_loss = np.inf
         for train_num in range(self.ntries):

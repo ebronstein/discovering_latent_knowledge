@@ -1,0 +1,6 @@
+*.pyc
+
+slurm/
+
+ccs_results/
+generated_hidden_states/
