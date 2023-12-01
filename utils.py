@@ -260,7 +260,7 @@ class ContrastDataset(Dataset):
         # get the possible labels
         # (for simplicity assume the binary case for contrast pairs)
         label_list = self.prompt.get_answer_choices_list(data)
-        assert len(label_list) == 2, print("Make sure there are only two possible answers! Actual number of answers:", label_list)
+        assert len(label_list) == 2, f"Make sure there are only two possible answers! Actual number of answers: {len(label_list)}"
 
         # reconvert to dataset format but with fake/candidate labels to create the contrast pair
         neg_example = {"text": text, "label": 0}
@@ -275,9 +275,9 @@ class ContrastDataset(Dataset):
 
         # verify these are different (e.g. tokenization didn't cut off the difference between them)
         if self.use_decoder and self.model_type == "encoder_decoder":
-            assert (neg_ids["decoder_input_ids"] - pos_ids["decoder_input_ids"]).sum() != 0, print("The decoder_input_ids for the contrast pairs are the same!", neg_ids, pos_ids)
+            assert (neg_ids["decoder_input_ids"] - pos_ids["decoder_input_ids"]).sum() != 0, f"The decoder_input_ids for the contrast pairs are the same! neg_ids: {neg_ids}, pos_ids: {pos_ids}"
         else:
-            assert (neg_ids["input_ids"] - pos_ids["input_ids"]).sum() != 0, print("The input_ids for the contrast pairs are the same!", neg_ids, pos_ids)
+            assert (neg_ids["input_ids"] - pos_ids["input_ids"]).sum() != 0, f"The input_ids for the contrast pairs are the same! neg_ids: {neg_ids}, pos_ids: {pos_ids}"
 
         # return the tokenized inputs, the text prompts, and the true label
         return neg_ids, pos_ids, neg_prompt, pos_prompt, true_answer
@@ -380,7 +380,7 @@ def get_individual_hidden_states(model, batch_ids, layer=None, all_layers=True, 
     else:
         # if token_idx == -1, then takes the hidden states corresponding to the last non-mask tokens
         # first we need to get the first mask location for each example in the batch
-        assert token_idx < 0, print("token_idx must be either 0 or negative, but got", token_idx)
+        assert token_idx < 0, f"token_idx must be either 0 or negative, but got {token_idx}"
         mask = batch_ids["decoder_attention_mask"] if (model_type == "encoder_decoder" and use_decoder) else batch_ids["attention_mask"]
         first_mask_loc = get_first_mask_loc(mask).squeeze()
         final_hs = hs[torch.arange(hs.size(0)), first_mask_loc+token_idx]  # (bs, dim, num_layers)
